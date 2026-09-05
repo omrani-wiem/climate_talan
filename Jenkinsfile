@@ -20,25 +20,18 @@ pipeline {
 
         stage('Backend tests') {
             steps {
-                sh '''
-                    docker run --rm \
-                      -v "$PWD/backend:/workspace/backend" \
-                      -w /workspace \
-                      python:3.12-slim \
-                      sh -c "pip install --quiet -r backend/requirements.txt && python -m pytest -q"
-                '''
+                sh 'python3 -m venv .ci-venv'
+                sh '.ci-venv/bin/pip install --quiet -r backend/requirements.txt'
+                sh '.ci-venv/bin/python -m pytest -q'
             }
         }
 
         stage('Frontend build') {
             steps {
-                sh '''
-                    docker run --rm \
-                      -v "$PWD/frontend:/workspace/frontend" \
-                      -w /workspace/frontend \
-                      node:20-alpine \
-                      sh -c "npm ci && npm run build"
-                '''
+                dir('frontend') {
+                    sh 'npm ci'
+                    sh 'npm run build'
+                }
             }
         }
 
