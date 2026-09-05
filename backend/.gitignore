@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 data/
+!app/recommandations/data/
+!app/recommandations/data/index.json
+!app/recommandations/data/referentiel.json
 # Environment
 .env
 
