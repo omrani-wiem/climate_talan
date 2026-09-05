@@ -22,6 +22,10 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.recommandations.mistral_client import chat_text
 
+# Keep the original callable identity so offline tests can replace the client
+# without requiring a real API key, while production calls still fail clearly.
+_REAL_CHAT_TEXT = chat_text
+
 logger = get_logger(__name__)
 router = APIRouter()
 
@@ -223,7 +227,7 @@ async def chat(payload: ChatRequest) -> dict:
     logger.info("POST /chat  messages=%d  contexte=%s", len(payload.messages),
                 "oui" if payload.contexte else "non")
 
-    if not settings.mistral_api_key:
+    if not settings.mistral_api_key and chat_text is _REAL_CHAT_TEXT:
         raise HTTPException(
             status_code=503,
             detail="Assistant IA indisponible : MISTRAL_API_KEY absente "
