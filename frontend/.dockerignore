@@ -1,0 +1,7 @@
+node_modules/
+dist/
+bim-viewer/dist/
+bim-viewer/node_modules/
+.env
+.env.*
+*.log
