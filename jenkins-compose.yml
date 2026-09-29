@@ -12,7 +12,9 @@ services:
       - jenkins_home:/var/jenkins_home
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      JAVA_OPTS: "-Djenkins.install.runSetupWizard=true"
+      JENKINS_OPTS: "-Djenkins.install.runSetupWizard=true"
 
 volumes:
   jenkins_home:
+
+#un fichier Docker Compose, mais il est dédié à l'installation/exécution de Jenkins.

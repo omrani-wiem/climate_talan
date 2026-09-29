@@ -1,285 +1,3 @@
-"""
-gltf_builder — Pure Python glTF 2.0 (.glb) builder for building footprints.
-
-Two builders coexist here :
-
-1. `build_glb(ring, height_m, ...)` — the original extruded prism (floor slab +
-   walls + flat roof, one material). Kept as the generic fallback (box) when
-   no BDNB geometry is available.
-
-2. `build_glb_bim(polygones, ...)` — the BIM-grade builder used by the
-   `/diagnostic/adresse/gltf` endpoint when BDNB geometry is available :
-     - real footprint : EVERY polygon of the MultiPolygon is extruded
-       (`exterieur` + `trous` — courtyards become interior walls, no more box),
-     - per-level floor slabs (one per `nb_niveau`, visible in section view),
-     - pitched roof (`deux_pans` default) with a slope derived from the roof
-       material (`pente_toit_deg`), ridge aligned on the dominant facade axis,
-     - multi-material glTF : walls / roof / slabs each get their own primitive
-       and material, colored from the BDNB material labels (`mat_mur_txt`,
-       `mat_toit_txt`) via a small palette,
-     - windows on the DPE-glazed facades (`l_orientation_baie_vitree` +
-       `pourcentage_surface_baie_vitree_exterieur`) with translucent glass
-       (alphaMode BLEND) + frames, and the entrance door on the street-facing
-       facade estimated from the geocoded address.
-
-No external dependencies — stdlib only (struct, json, math), like the rest of
-the digital_twin package. glTF 2.0 spec:
-  https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html
-
-Coordinate system: glTF is right-handed Y-up. The footprint rings produced by
-`footprint.extract_footprint` are already expressed in metres in the scene
-frame (x = Est, z = Sud, nord vers -z). We map: local_x -> glTF X, height -> Y,
-local_z -> glTF Z, exactly like `build_glb`.
-"""
-
-from __future__ import annotations
-
-import json
-import math
-import struct
-from pathlib import Path
-from typing import Any
-
-# ---------------------------------------------------------------------------
-# 1. Polygon helpers
-# ---------------------------------------------------------------------------
-
-Point2D = tuple[float, float]
-Point3D = tuple[float, float, float]
-
-
-def _signed_area_2d(ring: list[Point2D]) -> float:
-    n = len(ring)
-    total = 0.0
-    for i in range(n):
-        x1, y1 = ring[i]
-        x2, y2 = ring[(i + 1) % n]
-        total += x1 * y2 - x2 * y1
-    return total / 2.0
-
-
-def _ensure_ccw(ring: list[Point2D]) -> list[Point2D]:
-    """Ensure the ring is counter-clockwise (positive area) for glTF winding."""
-    if _signed_area_2d(ring) < 0:
-        return list(reversed(ring))
-    return ring
-
-
-def _cross_2d(o: Point2D, a: Point2D, b: Point2D) -> float:
-    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-
-
-def _segment_intersects(p: Point2D, q: Point2D, a: Point2D, b: Point2D) -> bool:
-    """Intersection PROPRE (intérieur des deux segments, pas seulement les
-    extrémités) — le pont peut toucher un sommet existant sans croiser."""
-    def orient(u: Point2D, v: Point2D, w: Point2D) -> float:
-        return (v[0] - u[0]) * (w[1] - u[1]) - (v[1] - u[1]) * (w[0] - u[0])
-
-    d1 = orient(a, b, p)
-    d2 = orient(a, b, q)
-    d3 = orient(p, q, a)
-    d4 = orient(p, q, b)
-    if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and (
-        (d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)
-    ):
-        return True
-    return False
-
-
-def _best_bridge_target(
-    hj: Point2D, ring: list[Point2D], hole: list[Point2D]
-) -> int:
-    """Meilleur sommet du contour pour ancrer le pont depuis hj : à droite du
-    trou (x >= x_hj) de préférence, visible (aucune arête croisée), sinon le
-    plus proche visible."""
-    best: int | None = None
-    best_d = float("inf")
-    for k, v in enumerate(ring):
-        if math.dist(v, hj) < 1e-9:
-            continue
-        # Visibilité : le segment ne croise aucune arête du contour ni du trou.
-        visible = True
-        for edges in (ring, hole):
-            n = len(edges)
-            for e in range(n):
-                a, b = edges[e], edges[(e + 1) % n]
-                if _segment_intersects(hj, v, a, b):
-                    visible = False
-                    break
-            if not visible:
-                break
-        if not visible:
-            continue
-        d = (v[0] - hj[0]) ** 2 + (v[1] - hj[1]) ** 2
-        if v[0] >= hj[0] - 1e-9 and d < best_d:
-            best, best_d = k, d
-    if best is not None:
-        return best
-    # Repli : plus proche visible, à gauche s'il le faut.
-    best = None
-    best_d = float("inf")
-    for k, v in enumerate(ring):
-        if math.dist(v, hj) < 1e-9:
-            continue
-        visible = True
-        for edges in (ring, hole):
-            n = len(edges)
-            for e in range(n):
-                a, b = edges[e], edges[(e + 1) % n]
-                if _segment_intersects(hj, v, a, b):
-                    visible = False
-                    break
-            if not visible:
-                break
-        if visible:
-            d = (v[0] - hj[0]) ** 2 + (v[1] - hj[1]) ** 2
-            if d < best_d:
-                best, best_d = k, d
-    return best if best is not None else 0
-
-
-def _point_in_ring_2d(point: Point2D, ring: list[Point2D]) -> bool:
-    """Ray-casting point-in-polygon test (ring can be CW or CCW)."""
-    x, y = point
-    inside = False
-    n = len(ring)
-    for i in range(n):
-        x1, y1 = ring[i]
-        x2, y2 = ring[(i + 1) % n]
-        if (y1 > y) != (y2 > y):
-            x_cross = x1 + (y - y1) / (y2 - y1) * (x2 - x1)
-            if x_cross > x:
-                inside = not inside
-    return inside
-
-
-def _triangulate_polygon(ring: list[Point2D]) -> list[tuple[int, int, int]]:
-    """
-    Ear-clipping triangulation for a simple convex or mildly concave polygon.
-    Returns list of (i, j, k) index triples into `ring`.
-    This is a simple O(n²) ear-clipper sufficient for building footprints
-    (typically 4–20 vertices).
-    """
-    indices = list(range(len(ring)))
-    triangles: list[tuple[int, int, int]] = []
-
-    def _is_ear(a: int, b: int, c: int) -> bool:
-        ax, ay = ring[a]
-        bx, by = ring[b]
-        cx, cy = ring[c]
-        # Cross product of (b-a) x (c-a) : must be positive (CCW)
-        cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
-        if cross <= 0:
-            return False
-        # Check no other point is inside triangle abc
-        for i in indices:
-            if i in (a, b, c):
-                continue
-            px, py = ring[i]
-            d1 = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
-            d2 = (cx - bx) * (py - by) - (cy - by) * (px - bx)
-            d3 = (ax - cx) * (py - cy) - (ay - cy) * (px - cx)
-            if d1 >= 0 and d2 >= 0 and d3 >= 0:
-                return False
-        return True
-
-    while len(indices) > 3:
-        n = len(indices)
-        ear_found = False
-        for i in range(n):
-            a = indices[(i - 1) % n]
-            b = indices[i]
-            c = indices[(i + 1) % n]
-            if _is_ear(a, b, c):
-                triangles.append((a, b, c))
-                indices.pop(i)
-                ear_found = True
-                break
-        if not ear_found:
-            # Degenerate polygon — just fan-triangulate from first vertex
-            for i in range(1, len(indices) - 1):
-                triangles.append((indices[0], indices[i], indices[i + 1]))
-            break
-
-    if len(indices) == 3:
-        triangles.append((indices[0], indices[1], indices[2]))
-
-    return triangles
-
-
-def _earclip_robust(ring: list[Point2D]) -> list[tuple[int, int, int]]:
-    """Ear-clipping tolerant of the zero-width bridge slits produced when
-    merging holes : collinear (degenerate) ears are dropped instead of
-    blocking the loop, so the slit never deadlocks the clipper."""
-    idx = list(range(len(ring)))
-    tris: list[tuple[int, int, int]] = []
-    guard = 0
-    while len(idx) > 3:
-        guard += 1
-        if guard > max(len(ring) * 40, 200):
-            break
-        n = len(idx)
-        clipped = False
-        for i in range(n):
-            a, b, c = idx[(i - 1) % n], idx[i], idx[(i + 1) % n]
-            cross = _cross_2d(ring[a], ring[b], ring[c])
-            if abs(cross) <= 1e-9:
-                # Ear dégénéré (fente du pont, doublon) : on retire le sommet
-                # sans émettre de triangle.
-                idx.pop(i)
-                clipped = True
-                break
-            if cross <= 0:
-                continue  # reflex
-            # Aucun autre point à l'intérieur du triangle ? (les sommets
-            # dupliqués par la fente sont coïncidents avec a/b/c : on les
-            # ignore, sinon aucun ear ne passerait autour du pont).
-            inside = False
-            for k in idx:
-                if k in (a, b, c):
-                    continue
-                if any(
-                    math.dist(ring[k], ring[v]) < 1e-9 for v in (a, b, c)
-                ):
-                    continue
-                d1 = _cross_2d(ring[a], ring[b], ring[k])
-                d2 = _cross_2d(ring[b], ring[c], ring[k])
-                d3 = _cross_2d(ring[c], ring[a], ring[k])
-                if d1 > -1e-9 and d2 > -1e-9 and d3 > -1e-9:
-                    inside = True
-                    break
-            if not inside:
-                tris.append((a, b, c))
-                idx.pop(i)
-                clipped = True
-                break
-        if not clipped:
-            # Coin coincident dégénéré : fan triangulation de secours.
-            for i in range(1, len(idx) - 1):
-                tris.append((idx[0], idx[i], idx[i + 1]))
-            break
-    if len(idx) == 3:
-        tris.append((idx[0], idx[1], idx[2]))
-    return tris
-
-
-def _triangulate_polygon_with_holes(
-    exterior: list[Point2D], holes: list[list[Point2D]]
-) -> tuple[list[Point2D], list[tuple[int, int, int]]]:
-    """
-    Ear-clipping triangulation of a polygon with holes (bridge-cut method).
-
-    Each hole (cour intérieure) is bridged to the exterior ring by a pair of
-    coincident edges (the bridge vertex is duplicated at both ends), then the
-    resulting simple polygon is ear-clipped by `_earclip_robust` which drops
-    the degenerate slit ears. Robust enough for the courtyard shapes seen in
-    BDNB data.
-
-    Returns (merged_ring, triangles) where `triangles` index into
-    `merged_ring`. With no holes, `merged_ring` is the exterior itself.
-    """
-    if not holes:
-        return list(exterior), _triangulate_polygon(exterior)
 
     ring = list(exterior)
     # Ensure exterior CCW, holes CW — bridge-cut expects this orientation.
@@ -731,7 +449,289 @@ def build_glb(
     for x, y, z in vertices:
         pos_data.extend([x, y, z])
 
-    # Flatten indices (u16 or u32 depending on vertex count)
+    # Flatten in"""
+gltf_builder — Pure Python glTF 2.0 (.glb) builder for building footprints.
+
+Two builders coexist here :
+
+1. `build_glb(ring, height_m, ...)` — the original extruded prism (floor slab +
+   walls + flat roof, one material). Kept as the generic fallback (box) when
+   no BDNB geometry is available.
+
+2. `build_glb_bim(polygones, ...)` — the BIM-grade builder used by the
+   `/diagnostic/adresse/gltf` endpoint when BDNB geometry is available :
+     - real footprint : EVERY polygon of the MultiPolygon is extruded
+       (`exterieur` + `trous` — courtyards become interior walls, no more box),
+     - per-level floor slabs (one per `nb_niveau`, visible in section view),
+     - pitched roof (`deux_pans` default) with a slope derived from the roof
+       material (`pente_toit_deg`), ridge aligned on the dominant facade axis,
+     - multi-material glTF : walls / roof / slabs each get their own primitive
+       and material, colored from the BDNB material labels (`mat_mur_txt`,
+       `mat_toit_txt`) via a small palette,
+     - windows on the DPE-glazed facades (`l_orientation_baie_vitree` +
+       `pourcentage_surface_baie_vitree_exterieur`) with translucent glass
+       (alphaMode BLEND) + frames, and the entrance door on the street-facing
+       facade estimated from the geocoded address.
+
+No external dependencies — stdlib only (struct, json, math), like the rest of
+the digital_twin package. glTF 2.0 spec:
+  https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html
+
+Coordinate system: glTF is right-handed Y-up. The footprint rings produced by
+`footprint.extract_footprint` are already expressed in metres in the scene
+frame (x = Est, z = Sud, nord vers -z). We map: local_x -> glTF X, height -> Y,
+local_z -> glTF Z, exactly like `build_glb`.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import struct
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# 1. Polygon helpers
+# ---------------------------------------------------------------------------
+
+Point2D = tuple[float, float]
+Point3D = tuple[float, float, float]
+
+
+def _signed_area_2d(ring: list[Point2D]) -> float:
+    n = len(ring)
+    total = 0.0
+    for i in range(n):
+        x1, y1 = ring[i]
+        x2, y2 = ring[(i + 1) % n]
+        total += x1 * y2 - x2 * y1
+    return total / 2.0
+
+
+def _ensure_ccw(ring: list[Point2D]) -> list[Point2D]:
+    """Ensure the ring is counter-clockwise (positive area) for glTF winding."""
+    if _signed_area_2d(ring) < 0:
+        return list(reversed(ring))
+    return ring
+
+
+def _cross_2d(o: Point2D, a: Point2D, b: Point2D) -> float:
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+
+def _segment_intersects(p: Point2D, q: Point2D, a: Point2D, b: Point2D) -> bool:
+    """Intersection PROPRE (intérieur des deux segments, pas seulement les
+    extrémités) — le pont peut toucher un sommet existant sans croiser."""
+    def orient(u: Point2D, v: Point2D, w: Point2D) -> float:
+        return (v[0] - u[0]) * (w[1] - u[1]) - (v[1] - u[1]) * (w[0] - u[0])
+
+    d1 = orient(a, b, p)
+    d2 = orient(a, b, q)
+    d3 = orient(p, q, a)
+    d4 = orient(p, q, b)
+    if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and (
+        (d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)
+    ):
+        return True
+    return False
+
+
+def _best_bridge_target(
+    hj: Point2D, ring: list[Point2D], hole: list[Point2D]
+) -> int:
+    """Meilleur sommet du contour pour ancrer le pont depuis hj : à droite du
+    trou (x >= x_hj) de préférence, visible (aucune arête croisée), sinon le
+    plus proche visible."""
+    best: int | None = None
+    best_d = float("inf")
+    for k, v in enumerate(ring):
+        if math.dist(v, hj) < 1e-9:
+            continue
+        # Visibilité : le segment ne croise aucune arête du contour ni du trou.
+        visible = True
+        for edges in (ring, hole):
+            n = len(edges)
+            for e in range(n):
+                a, b = edges[e], edges[(e + 1) % n]
+                if _segment_intersects(hj, v, a, b):
+                    visible = False
+                    break
+            if not visible:
+                break
+        if not visible:
+            continue
+        d = (v[0] - hj[0]) ** 2 + (v[1] - hj[1]) ** 2
+        if v[0] >= hj[0] - 1e-9 and d < best_d:
+            best, best_d = k, d
+    if best is not None:
+        return best
+    # Repli : plus proche visible, à gauche s'il le faut.
+    best = None
+    best_d = float("inf")
+    for k, v in enumerate(ring):
+        if math.dist(v, hj) < 1e-9:
+            continue
+        visible = True
+        for edges in (ring, hole):
+            n = len(edges)
+            for e in range(n):
+                a, b = edges[e], edges[(e + 1) % n]
+                if _segment_intersects(hj, v, a, b):
+                    visible = False
+                    break
+            if not visible:
+                break
+        if visible:
+            d = (v[0] - hj[0]) ** 2 + (v[1] - hj[1]) ** 2
+            if d < best_d:
+                best, best_d = k, d
+    return best if best is not None else 0
+
+
+def _point_in_ring_2d(point: Point2D, ring: list[Point2D]) -> bool:
+    """Ray-casting point-in-polygon test (ring can be CW or CCW)."""
+    x, y = point
+    inside = False
+    n = len(ring)
+    for i in range(n):
+        x1, y1 = ring[i]
+        x2, y2 = ring[(i + 1) % n]
+        if (y1 > y) != (y2 > y):
+            x_cross = x1 + (y - y1) / (y2 - y1) * (x2 - x1)
+            if x_cross > x:
+                inside = not inside
+    return inside
+
+
+def _triangulate_polygon(ring: list[Point2D]) -> list[tuple[int, int, int]]:
+    """
+    Ear-clipping triangulation for a simple convex or mildly concave polygon.
+    Returns list of (i, j, k) index triples into `ring`.
+    This is a simple O(n²) ear-clipper sufficient for building footprints
+    (typically 4–20 vertices).
+    """
+    indices = list(range(len(ring)))
+    triangles: list[tuple[int, int, int]] = []
+
+    def _is_ear(a: int, b: int, c: int) -> bool:
+        ax, ay = ring[a]
+        bx, by = ring[b]
+        cx, cy = ring[c]
+        # Cross product of (b-a) x (c-a) : must be positive (CCW)
+        cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        if cross <= 0:
+            return False
+        # Check no other point is inside triangle abc
+        for i in indices:
+            if i in (a, b, c):
+                continue
+            px, py = ring[i]
+            d1 = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+            d2 = (cx - bx) * (py - by) - (cy - by) * (px - bx)
+            d3 = (ax - cx) * (py - cy) - (ay - cy) * (px - cx)
+            if d1 >= 0 and d2 >= 0 and d3 >= 0:
+                return False
+        return True
+
+    while len(indices) > 3:
+        n = len(indices)
+        ear_found = False
+        for i in range(n):
+            a = indices[(i - 1) % n]
+            b = indices[i]
+            c = indices[(i + 1) % n]
+            if _is_ear(a, b, c):
+                triangles.append((a, b, c))
+                indices.pop(i)
+                ear_found = True
+                break
+        if not ear_found:
+            # Degenerate polygon — just fan-triangulate from first vertex
+            for i in range(1, len(indices) - 1):
+                triangles.append((indices[0], indices[i], indices[i + 1]))
+            break
+
+    if len(indices) == 3:
+        triangles.append((indices[0], indices[1], indices[2]))
+
+    return triangles
+
+
+def _earclip_robust(ring: list[Point2D]) -> list[tuple[int, int, int]]:
+    """Ear-clipping tolerant of the zero-width bridge slits produced when
+    merging holes : collinear (degenerate) ears are dropped instead of
+    blocking the loop, so the slit never deadlocks the clipper."""
+    idx = list(range(len(ring)))
+    tris: list[tuple[int, int, int]] = []
+    guard = 0
+    while len(idx) > 3:
+        guard += 1
+        if guard > max(len(ring) * 40, 200):
+            break
+        n = len(idx)
+        clipped = False
+        for i in range(n):
+            a, b, c = idx[(i - 1) % n], idx[i], idx[(i + 1) % n]
+            cross = _cross_2d(ring[a], ring[b], ring[c])
+            if abs(cross) <= 1e-9:
+                # Ear dégénéré (fente du pont, doublon) : on retire le sommet
+                # sans émettre de triangle.
+                idx.pop(i)
+                clipped = True
+                break
+            if cross <= 0:
+                continue  # reflex
+            # Aucun autre point à l'intérieur du triangle ? (les sommets
+            # dupliqués par la fente sont coïncidents avec a/b/c : on les
+            # ignore, sinon aucun ear ne passerait autour du pont).
+            inside = False
+            for k in idx:
+                if k in (a, b, c):
+                    continue
+                if any(
+                    math.dist(ring[k], ring[v]) < 1e-9 for v in (a, b, c)
+                ):
+                    continue
+                d1 = _cross_2d(ring[a], ring[b], ring[k])
+                d2 = _cross_2d(ring[b], ring[c], ring[k])
+                d3 = _cross_2d(ring[c], ring[a], ring[k])
+                if d1 > -1e-9 and d2 > -1e-9 and d3 > -1e-9:
+                    inside = True
+                    break
+            if not inside:
+                tris.append((a, b, c))
+                idx.pop(i)
+                clipped = True
+                break
+        if not clipped:
+            # Coin coincident dégénéré : fan triangulation de secours.
+            for i in range(1, len(idx) - 1):
+                tris.append((idx[0], idx[i], idx[i + 1]))
+            break
+    if len(idx) == 3:
+        tris.append((idx[0], idx[1], idx[2]))
+    return tris
+
+
+def _triangulate_polygon_with_holes(
+    exterior: list[Point2D], holes: list[list[Point2D]]
+) -> tuple[list[Point2D], list[tuple[int, int, int]]]:
+    """
+    Ear-clipping triangulation of a polygon with holes (bridge-cut method).
+
+    Each hole (cour intérieure) is bridged to the exterior ring by a pair of
+    coincident edges (the bridge vertex is duplicated at both ends), then the
+    resulting simple polygon is ear-clipped by `_earclip_robust` which drops
+    the degenerate slit ears. Robust enough for the courtyard shapes seen in
+    BDNB data.
+
+    Returns (merged_ring, triangles) where `triangles` index into
+    `merged_ring`. With no holes, `merged_ring` is the exterior itself.
+    """
+    if not holes:
+        return list(exterior), _triangulate_polygon(exterior)
+dices (u16 or u32 depending on vertex count)
     use_u32 = len(vertices) > 65535
     idx_data: list[int] = []
     for a, b, c in triangles:
